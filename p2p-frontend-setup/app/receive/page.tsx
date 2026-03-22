@@ -28,7 +28,6 @@ export default function ReceivePage() {
   const [transferProgress, setTransferProgress] = useState(0);
   const [fileUrl, setFileUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // const [receivedBytes, setReceivedBytes] = useState(0)
 
   const receivedBytes = useRef<number>(0);
   const fileSizeRef = useRef<number>(0);
@@ -38,30 +37,60 @@ export default function ReceivePage() {
   const MAX_RECONNECT_ATTEMPTS = 5;
   const RECONNECT_DELAY = 3000;
 
+  // ── Encryption state ────────────────────────────────────────────────────────
+  const sessionKeyRef = useRef<CryptoKey | null>(null);
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  /** Import the base64 key sent by the server into a WebCrypto CryptoKey */
+  const importSessionKey = async (base64Key: string): Promise<CryptoKey> => {
+    const raw = Uint8Array.from(atob(base64Key), (c) => c.charCodeAt(0));
+    return crypto.subtle.importKey(
+      "raw",
+      raw,
+      { name: "AES-GCM" },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  };
+
+  /**
+   * Decrypt a binary chunk received from the server.
+   * Expected layout: nonce (12 bytes) || AES-GCM ciphertext
+   */
+  const decryptChunk = async (payload: ArrayBuffer): Promise<ArrayBuffer> => {
+    if (!sessionKeyRef.current) throw new Error("No session key");
+    if (payload.byteLength < 12) throw new Error("Payload too short");
+
+    const nonce = payload.slice(0, 12);
+    const ciphertext = payload.slice(12);
+
+    return crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: nonce },
+      sessionKeyRef.current,
+      ciphertext
+    );
+  };
+
+  // ── File handling ────────────────────────────────────────────────────────────
+
   const handleFileInfo = (data: { name: string; size: number }) => {
-    const fileInfo = {
-      name: data.name,
-      size: data.size,
-    };
-    setFileMetadata(fileInfo);
-    fileSizeRef.current = data.size; // Update the ref
+    setFileMetadata({ name: data.name, size: data.size });
+    fileSizeRef.current = data.size;
     receivedChunksRef.current = [];
-    // setReceivedBytes(0);
     receivedBytes.current = 0;
     setTransferProgress(0);
     setError(null);
   };
 
-  const handleReceivedChunk = (chunkData: ArrayBuffer) => {
-    if (!chunkData || chunkData.byteLength === 0) {
-      return;
-    }
-    receivedChunksRef.current.push(chunkData);
-    const newReceivedBytes = receivedBytes.current + chunkData.byteLength;
-    // setReceivedBytes(newReceivedBytes);
+  /** Called with the already-decrypted plaintext of each chunk */
+  const handleDecryptedChunk = (plaintext: ArrayBuffer) => {
+    if (!plaintext || plaintext.byteLength === 0) return;
+
+    receivedChunksRef.current.push(plaintext);
+    const newReceivedBytes = receivedBytes.current + plaintext.byteLength;
     receivedBytes.current = newReceivedBytes;
 
-    // Calculate progress using the ref instead of state
     if (fileSizeRef.current > 0) {
       const progress = Math.min(
         100,
@@ -71,15 +100,14 @@ export default function ReceivePage() {
     }
   };
 
+  // ── WebSocket ────────────────────────────────────────────────────────────────
+
   const connectWebSocket = () => {
-    if (!senderId) {
-      return;
-    }
+    if (!senderId) return;
 
     setIsConnecting(true);
     setError(null);
     receivedChunksRef.current = [];
-    // setReceivedBytes(0)
     receivedBytes.current = 0;
     setTransferProgress(0);
 
@@ -88,17 +116,13 @@ export default function ReceivePage() {
 
     ws.onopen = () => {
       reconnectAttemptsRef.current = 0;
-      const connectionId = typeof crypto.randomUUID === "function" ? 
-        crypto.randomUUID()
-        : "fallback" + Math.random().toString(36).substring(2,15);
 
-      ws.send(
-        JSON.stringify({
-          type: "register",
-          connectionId: connectionId,
-        })
-      );
+      const connectionId =
+        typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : "fallback" + Math.random().toString(36).substring(2, 15);
 
+      ws.send(JSON.stringify({ type: "register", connectionId }));
       ws.send(
         JSON.stringify({
           target_id: senderId,
@@ -109,103 +133,128 @@ export default function ReceivePage() {
 
       setIsConnected(true);
       setIsConnecting(false);
-
     };
 
-    ws.onmessage = (event) => {
-      if (typeof event.data === "string"){
+    ws.onmessage = async (event) => {
+      // ── Text / JSON messages ───────────────────────────────────────────────
+      if (typeof event.data === "string") {
         try {
           const data = JSON.parse(event.data);
 
-          if(data.type === "file-info") {
-            handleFileInfo(data);
-          }else if (data.type === "file-end"){
-            const expectedSize = data.totalBytes || fileMetadata?.size || 0
+          // ── Receive session key from server ────────────────────────────────
+          if (data.type === "session_key") {
+            try {
+              sessionKeyRef.current = await importSessionKey(data.key);
+              console.log("Session key imported — channel is encrypted");
+            } catch (e) {
+              console.error("Failed to import session key:", e);
+            }
+            return;
+          }
 
-            setTimeout(() => {
-              if(receivedBytes.current >= expectedSize * 0.95) {
+          if (data.type === "file-info") {
+            handleFileInfo(data);
+          } else if (data.type === "file-end") {
+            const expectedSize = data.totalBytes || fileMetadata?.size || 0;
+            window.setTimeout(() => {
+              if (receivedBytes.current >= expectedSize * 0.95) {
                 completeFileTransfer();
               }
-            }, 500)
+            }, 500);
           }
-        } catch(e) {
-          console.error(`Error processing message: &{e}`);
+        } catch (e) {
+          console.error("Error processing message:", e);
         }
-      } else if (event.data instanceof ArrayBuffer) {
-        handleReceivedChunk(event.data);
-      } else if(event.data instanceof Blob){
-        const reader = new FileReader();
-        reader.onload = () => {
-          if (reader.result) handleReceivedChunk(reader.result as ArrayBuffer);
-        };
-        reader.readAsArrayBuffer(event.data);
+        return;
+      }
 
+      // ── Binary messages (encrypted chunks) ────────────────────────────────
+      let raw: ArrayBuffer | null = null;
+
+      if (event.data instanceof ArrayBuffer) {
+        raw = event.data;
+      } else if (event.data instanceof Blob) {
+        raw = await event.data.arrayBuffer();
+      }
+
+      if (!raw) return;
+
+      // ── Decrypt the chunk ──────────────────────────────────────────────────
+      if (!sessionKeyRef.current) {
+        console.error("Binary chunk arrived before session key — dropping");
+        return;
+      }
+
+      try {
+        const plaintext = await decryptChunk(raw);
+        handleDecryptedChunk(plaintext);
+      } catch (e) {
+        console.error("Decryption failed for chunk:", e);
+        setError("Decryption failed — file may be corrupted.");
       }
     };
 
-    ws.onerror = (error) => {
-      console.error(`Websocket error: ${error}`);
+    ws.onerror = (err) => {
+      console.error("WebSocket error:", err);
+      setIsConnecting(false);
     };
 
     ws.onclose = () => {
       setIsConnected(false);
       setIsConnecting(false);
+      sessionKeyRef.current = null;
 
-      if(reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS){
-              reconnectAttemptsRef.current++;
-              setTimeout(connectWebSocket, RECONNECT_DELAY);
+      if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+        reconnectAttemptsRef.current++;
+        window.setTimeout(connectWebSocket, RECONNECT_DELAY);
       }
-    }
+    };
   };
+
+  // ── Assemble file ────────────────────────────────────────────────────────────
 
   const completeFileTransfer = () => {
     try {
-      // Verify we received some data
       if (receivedChunksRef.current.length === 0) {
-        throw new Error("No data received - transfer failed");
+        throw new Error("No data received — transfer failed");
       }
 
       const blob = new Blob(receivedChunksRef.current, {
         type: "application/octet-stream",
       });
 
-      if (blob.size === 0) {
-        throw new Error("Received empty file");
-      }
+      if (blob.size === 0) throw new Error("Received empty file");
 
-      const url = URL.createObjectURL(blob);
-      setFileUrl(url);
-
+      setFileUrl(URL.createObjectURL(blob));
       setError(null);
     } catch (e) {
-      console.error(`Error completing transfer: ${e}`, true);
+      console.error("Error completing transfer:", e);
+      setError(String(e));
     }
   };
 
   const downloadFile = () => {
     if (!fileUrl || !fileMetadata) return;
-
     const a = document.createElement("a");
     a.href = fileUrl;
     a.download = fileMetadata.name;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    // Consider revoking the object URL after download
   };
 
-  // Clean up WebSocket connection on unmount
+  // ── Cleanup ──────────────────────────────────────────────────────────────────
+
   useEffect(() => {
     return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      wsRef.current?.close();
     };
   }, []);
 
+  // ── Render ───────────────────────────────────────────────────────────────────
+
   return (
     <div className="min-h-screen flex flex-col">
-      {/* Header */}
       <header className="container flex items-center justify-between p-4">
         <Link href="/">
           <Button variant="ghost" size="icon">
@@ -216,25 +265,22 @@ export default function ReceivePage() {
         <ThemeToggle />
       </header>
 
-      {/* Main content */}
       <main className="flex-1 container flex flex-col items-center justify-center py-8 max-w-md">
         <div className="w-full space-y-8">
           {!senderId ? (
-            <>
-              <div className="text-center space-y-4">
-                <div className="w-12 h-12 mx-auto rounded-full bg-secondary flex items-center justify-center">
-                  <WifiIcon className="h-6 w-6" />
-                </div>
-                <h1 className="text-2xl font-bold">No Transfer ID</h1>
-                <p className="text-muted-foreground">
-                  You need a transfer ID to receive files. Ask the sender to
-                  generate a link.
-                </p>
-                <Link href="/" className="inline-block mt-2">
-                  <Button>Go to Home</Button>
-                </Link>
+            <div className="text-center space-y-4">
+              <div className="w-12 h-12 mx-auto rounded-full bg-secondary flex items-center justify-center">
+                <WifiIcon className="h-6 w-6" />
               </div>
-            </>
+              <h1 className="text-2xl font-bold">No Transfer ID</h1>
+              <p className="text-muted-foreground">
+                You need a transfer ID to receive files. Ask the sender to
+                generate a link.
+              </p>
+              <Link href="/" className="inline-block mt-2">
+                <Button>Go to Home</Button>
+              </Link>
+            </div>
           ) : !isConnected && !isConnecting ? (
             <>
               <div className="text-center space-y-2">
@@ -246,7 +292,6 @@ export default function ReceivePage() {
 
               <div className="flex flex-col items-center my-6">
                 <WifiAnimation active={false} />
-
                 {error && (
                   <div className="w-full p-4 bg-red-100 dark:bg-red-900/30 rounded-lg flex items-start space-x-3">
                     <AlertCircleIcon className="h-5 w-5 text-red-600 dark:text-red-400 mt-0.5" />
@@ -268,17 +313,15 @@ export default function ReceivePage() {
               </Button>
             </>
           ) : isConnecting ? (
-            <>
-              <div className="text-center space-y-4">
-                <div className="w-12 h-12 mx-auto rounded-full bg-secondary flex items-center justify-center">
-                  <Loader2Icon className="h-6 w-6 animate-spin" />
-                </div>
-                <h1 className="text-2xl font-bold">Connecting...</h1>
-                <p className="text-muted-foreground">
-                  Establishing secure WebSocket connection with the server
-                </p>
+            <div className="text-center space-y-4">
+              <div className="w-12 h-12 mx-auto rounded-full bg-secondary flex items-center justify-center">
+                <Loader2Icon className="h-6 w-6 animate-spin" />
               </div>
-            </>
+              <h1 className="text-2xl font-bold">Connecting...</h1>
+              <p className="text-muted-foreground">
+                Establishing secure WebSocket connection with the server
+              </p>
+            </div>
           ) : fileUrl ? (
             <>
               <div className="text-center space-y-4">
@@ -288,11 +331,7 @@ export default function ReceivePage() {
                 <h1 className="text-2xl font-bold">Transfer Complete</h1>
                 <p className="text-muted-foreground">
                   {fileMetadata?.name} (
-                  {(fileMetadata?.size
-                    ? fileMetadata.size / 1024 / 1024
-                    : 0
-                  ).toFixed(2)}{" "}
-                  MB)
+                  {((fileMetadata?.size ?? 0) / 1024 / 1024).toFixed(2)} MB)
                 </p>
               </div>
 

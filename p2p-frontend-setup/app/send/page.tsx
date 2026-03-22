@@ -19,8 +19,6 @@ import {
 } from "lucide-react";
 import { generateId } from "@/lib/utils";
 import Link from "next/link";
-import { error } from "node:console";
-import { setTimeout } from "node:timers/promises";
 
 export default function SendPage() {
   const [file, setFile] = useState<File | null>(null);
@@ -36,6 +34,45 @@ export default function SendPage() {
   const reconnectAttemptsRef = useRef(0);
   const MAX_RECONNECT_ATTEMPTS = 5;
   const RECONNECT_DELAY = 3000;
+
+  // ── Encryption state ────────────────────────────────────────────────────────
+  const sessionKeyRef = useRef<CryptoKey | null>(null);
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  /** Import the base64 key sent by the server into a WebCrypto CryptoKey */
+  const importSessionKey = async (base64Key: string): Promise<CryptoKey> => {
+    const raw = Uint8Array.from(atob(base64Key), (c) => c.charCodeAt(0));
+    return crypto.subtle.importKey(
+      "raw",
+      raw,
+      { name: "AES-GCM" },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  };
+
+  /**
+   * Encrypt `plaintext` bytes with the session key.
+   * Returns: nonce (12 bytes) || ciphertext
+   */
+  const encryptChunk = async (plaintext: Uint8Array): Promise<Uint8Array> => {
+    if (!sessionKeyRef.current) throw new Error("No session key");
+
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: nonce },
+      sessionKeyRef.current,
+      plaintext.buffer as ArrayBuffer
+    );
+
+    const out = new Uint8Array(12 + ciphertext.byteLength);
+    out.set(nonce, 0);
+    out.set(new Uint8Array(ciphertext), 12);
+    return out;
+  };
+
+  // ── File input ───────────────────────────────────────────────────────────────
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -54,14 +91,16 @@ export default function SendPage() {
     e.preventDefault();
   };
 
+  // ── WebSocket ────────────────────────────────────────────────────────────────
+
   const connectWebSocket = () => {
-    if (wsRef.current && wsRef.current.readyState == WebSocket.OPEN){
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       return wsRef.current;
     }
 
     const ws = new WebSocket(`ws://${window.location.hostname}:8000/ws`);
     wsRef.current = ws;
-    
+
     ws.onopen = () => {
       reconnectAttemptsRef.current = 0;
       const connectionId = generateId(8);
@@ -72,29 +111,42 @@ export default function SendPage() {
           type: "register",
           connectionId: connectionId,
         })
-      )
+      );
     };
-    
-    ws.onmessage = (event) => {
-      if (typeof event.data === "string"){
+
+    ws.onmessage = async (event) => {
+      if (typeof event.data === "string") {
         const data = JSON.parse(event.data);
-        if (data.type === "receiver-ready"){
+
+        // ── Receive session key from server ──────────────────────────────────
+        if (data.type === "session_key") {
+          try {
+            sessionKeyRef.current = await importSessionKey(data.key);
+            console.log("Session key imported — channel is encrypted");
+          } catch (e) {
+            console.error("Failed to import session key:", e);
+          }
+          return;
+        }
+
+        if (data.type === "receiver-ready") {
           recipientIdRef.current = data.senderId;
           setIsConnected(true);
-        }else if(data.type ==="transfer-complete"){
+        } else if (data.type === "transfer-complete") {
           setTransferProgress(100);
         }
       }
     };
 
-    ws.onerror = (error) => {
+    ws.onerror = () => {
       setIsGeneratingLink(false);
     };
 
-    ws.onclose = () =>{
+    ws.onclose = () => {
       setIsConnected(false);
+      sessionKeyRef.current = null;
 
-      if(reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS){
+      if (reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
         reconnectAttemptsRef.current++;
         window.setTimeout(connectWebSocket, RECONNECT_DELAY);
       }
@@ -105,19 +157,18 @@ export default function SendPage() {
 
   const generateReceiverLink = async () => {
     if (!file) return;
-
     setIsGeneratingLink(true);
-
     try {
       connectWebSocket();
-    } catch (error) {
+    } catch {
       setIsGeneratingLink(false);
     }
   };
 
+  // ── Copy link ────────────────────────────────────────────────────────────────
+
   const copyLink = () => {
     if (!transferId) return;
-
     const link = `${window.location.origin}/receive?id=${transferId}`;
 
     if (navigator.clipboard && window.isSecureContext) {
@@ -127,11 +178,8 @@ export default function SendPage() {
           setCopied(true);
           window.setTimeout(() => setCopied(false), 2000);
         })
-        .catch((err) => { 
-          console.error("Clipboard copy failed:", err);
-        });
+        .catch((err) => console.error("Clipboard copy failed:", err));
     } else {
-      // Fallback for older browsers
       const textArea = document.createElement("textarea");
       textArea.value = link;
       textArea.style.position = "absolute";
@@ -150,48 +198,67 @@ export default function SendPage() {
     }
   };
 
+  // ── Send file (with encryption) ──────────────────────────────────────────────
+
   const sendFile = () => {
     if (!file || !wsRef.current || !recipientIdRef.current) return;
+
+    // Guard: don't send if key hasn't arrived yet
+    if (!sessionKeyRef.current) {
+      console.error("Session key not ready — cannot send encrypted data");
+      return;
+    }
+
     setFileSending(true);
-    // const CHUNK_SIZE = 65536 // 64KB chunks
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB chunks
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB
     let offset = 0;
     let chunkCount = 0;
 
+    // Send file metadata (plain JSON — no sensitive content)
     wsRef.current.send(
       JSON.stringify({
         target_id: recipientIdRef.current,
         type: "file-info",
         name: file.name,
         size: file.size,
-        mimeType: file.type || 'application/octet-stream',
+        mimeType: file.type || "application/octet-stream",
       })
     );
 
-
-
     const reader = new FileReader();
 
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       if (!e.target?.result) return;
 
-      const chunkData = new Uint8Array(e.target.result as ArrayBuffer);
-      const message = {
-        target_id : recipientIdRef.current,
-        type: "file-chunk",
-        chunkNumber: chunkCount,
-      };
+      const plainChunk = new Uint8Array(e.target.result as ArrayBuffer);
 
-      wsRef.current?.send(JSON.stringify(message));
-      wsRef.current?.send(chunkData);
+      // ── Encrypt the chunk before sending ──────────────────────────────────
+      let encryptedChunk: Uint8Array;
+      try {
+        encryptedChunk = await encryptChunk(plainChunk);
+      } catch (err) {
+        console.error("Encryption failed:", err);
+        setFileSending(false);
+        return;
+      }
 
-      offset += chunkData.length;
+      // Send chunk metadata (JSON) then the encrypted binary payload
+      wsRef.current?.send(
+        JSON.stringify({
+          target_id: recipientIdRef.current,
+          type: "file-chunk",
+          chunkNumber: chunkCount,
+        })
+      );
+      wsRef.current?.send(encryptedChunk.buffer);
+
+      offset += plainChunk.length;
       chunkCount++;
- 
-      const progress = Math.min(100, Math.floor((offset / file.size) * 100))
+
+      const progress = Math.min(100, Math.floor((offset / file.size) * 100));
       setTransferProgress(progress);
 
-      if(offset < file.size) {
+      if (offset < file.size) {
         window.setTimeout(() => {
           const slice = file.slice(offset, offset + CHUNK_SIZE);
           reader.readAsArrayBuffer(slice);
@@ -202,34 +269,32 @@ export default function SendPage() {
             target_id: recipientIdRef.current,
             type: "file-end",
             chunkCount: chunkCount,
-
           })
         );
         setFileSending(false);
       }
     };
 
-    reader.onerror = (e) => {
+    reader.onerror = () => {
       setFileSending(false);
     };
 
-    // Start reading the first chunk
     const slice = file.slice(offset, offset + CHUNK_SIZE);
     reader.readAsArrayBuffer(slice);
   };
 
-  // Clean up WebSocket connection on unmount
+  // ── Cleanup ──────────────────────────────────────────────────────────────────
+
   useEffect(() => {
     return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      wsRef.current?.close();
     };
   }, []);
 
+  // ── Render ───────────────────────────────────────────────────────────────────
+
   return (
     <div className="min-h-screen flex flex-col gradient-bg">
-      {/* Header */}
       <header className="container flex items-center justify-between p-4">
         <Link href="/">
           <Button
@@ -244,7 +309,6 @@ export default function SendPage() {
         <ThemeToggle />
       </header>
 
-      {/* Main content */}
       <main className="flex-1 container flex flex-col items-center justify-center py-8 max-w-md">
         <div className="w-full space-y-8">
           {!file && (
@@ -274,9 +338,7 @@ export default function SendPage() {
                 <p className="text-base font-medium mb-1">
                   Drag and drop your file here
                 </p>
-                <p className="text-sm text-muted-foreground">
-                  or click to browse
-                </p>
+                <p className="text-sm text-muted-foreground">or click to browse</p>
               </div>
             </>
           )}
@@ -370,7 +432,7 @@ export default function SendPage() {
                     <Button
                       className="w-full py-6 rounded-xl hover-lift"
                       onClick={sendFile}
-                      disabled={fileSending}
+                      disabled={fileSending || !sessionKeyRef.current}
                     >
                       {fileSending ? (
                         <Loader2Icon className="mr-2 h-5 w-5 animate-spin" />
@@ -384,9 +446,7 @@ export default function SendPage() {
               ) : (
                 <div className="flex items-center justify-center space-x-2 text-sm text-muted-foreground p-4 rounded-xl bg-secondary/50 glass">
                   <div className="dot-pulse"></div>
-                  <span className="ml-6">
-                    Waiting for recipient to connect...
-                  </span>
+                  <span className="ml-6">Waiting for recipient to connect...</span>
                 </div>
               )}
             </>
